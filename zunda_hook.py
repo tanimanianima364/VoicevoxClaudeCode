@@ -72,51 +72,74 @@ def zundamon_summarize(text: str) -> str:
         f"会話:\n{text}"
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.8},
-    }).encode("utf-8")
-
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return text.strip()
+        return _call_gemini(prompt, max_tokens=300, temperature=0.8)
     except Exception as e:
         return f"Gemini APIでエラーが出たのだ…{e}"
 
 
+def _call_gemini(prompt: str, max_tokens: int = 300, temperature: float = 0.7) -> str:
+    """Low-level Gemini API call. Returns generated text or raises."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+
 def zundamon_answer(question: str) -> str:
-    """Answer a user question as Zundamon via Gemini API."""
+    """Answer a question using a 3-step debate pipeline: Draft → Critique → Final."""
     if not GEMINI_API_KEY:
         return "Gemini APIキーが設定されてないのだ！"
 
-    prompt = (
+    # Step 1: Draft — generate an initial answer
+    draft_prompt = (
+        "以下のユーザーの質問に、技術的に正確かつ簡潔に答えてください。200文字以内。\n\n"
+        f"質問: {question}"
+    )
+    try:
+        draft = _call_gemini(draft_prompt, max_tokens=400, temperature=0.7)
+        log(f"[debate] draft: {draft[:100]}")
+    except Exception as e:
+        return f"うまく答えられなかったのだ…{e}"
+
+    # Step 2: Critique — fact-check and identify issues
+    critique_prompt = (
+        "あなたは厳密なファクトチェッカーです。\n"
+        "以下の「質問」と「回答案」を検証し、事実誤認・不正確な点・不足している点を指摘してください。\n"
+        "問題がなければ「問題なし」とだけ答えてください。200文字以内。\n\n"
+        f"質問: {question}\n\n"
+        f"回答案: {draft}"
+    )
+    try:
+        critique = _call_gemini(critique_prompt, max_tokens=400, temperature=0.3)
+        log(f"[debate] critique: {critique[:100]}")
+    except Exception:
+        critique = "検証できなかったため、回答案をそのまま使用する"
+
+    # Step 3: Synthesize — produce final Zundamon-style answer
+    synth_prompt = (
         "あなたは「ずんだもん」です。東北地方の妖精で、語尾に「なのだ」「のだ」をつけて話します。\n"
-        "以下のユーザーの質問に、ずんだもんとして**正確かつ親切に**答えてください。\n"
+        "以下の「質問」「回答案」「批評」を踏まえて、正確さを担保した最終回答を作成してください。\n"
         "ルール:\n"
         "- 語尾は「なのだ」「のだ」「だよ」を使う\n"
+        "- 批評で指摘された問題があれば修正すること\n"
         "- 技術用語はそのまま使ってOK\n"
         "- 明るく元気な口調で\n"
         "- 200文字以内で簡潔に答えること\n"
         "- 余計な前置きは不要。回答だけ出力すること\n\n"
-        f"質問: {question}"
+        f"質問: {question}\n\n"
+        f"回答案: {draft}\n\n"
+        f"批評: {critique}"
     )
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.7},
-    }).encode("utf-8")
-
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            return text.strip()
+        final = _call_gemini(synth_prompt, max_tokens=400, temperature=0.5)
+        log(f"[debate] final: {final[:100]}")
+        return final
     except Exception as e:
         return f"うまく答えられなかったのだ…{e}"
 

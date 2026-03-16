@@ -11,6 +11,7 @@ import tempfile
 import shutil
 import subprocess
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import zunda_hook
@@ -291,6 +292,115 @@ class TestSpeedValidation(unittest.TestCase):
 
     def test_boundary_high(self):
         self.assertEqual(min(2.0, max(0.5, 2.0)), 2.0)
+
+
+class TestDebatePipeline(unittest.TestCase):
+    """Tests for the 3-step debate pipeline in zundamon_answer."""
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_full_pipeline_3_calls(self, mock_gemini):
+        """All 3 steps succeed — _call_gemini called exactly 3 times."""
+        mock_gemini.side_effect = [
+            "Draft answer about Python decorators",
+            "問題なし",
+            "Pythonのデコレータは関数を修飾する仕組みなのだ！",
+        ]
+        result = zunda_hook.zundamon_answer("Pythonのデコレータって何？")
+        self.assertEqual(mock_gemini.call_count, 3)
+        self.assertIn("なのだ", result)
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_critique_feeds_into_synthesis(self, mock_gemini):
+        """Critique output is passed to the synthesis step."""
+        mock_gemini.side_effect = [
+            "Wrong: Python is compiled",
+            "事実誤認: Pythonはインタプリタ言語である",
+            "Pythonはインタプリタ言語なのだ！",
+        ]
+        result = zunda_hook.zundamon_answer("Pythonは何語？")
+        # Verify the 3rd call (synthesis) received the critique
+        synth_prompt = mock_gemini.call_args_list[2][0][0]
+        self.assertIn("事実誤認", synth_prompt)
+        self.assertIn("インタプリタ", result)
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_draft_failure_returns_error(self, mock_gemini):
+        """If draft (step 1) fails, return error immediately."""
+        mock_gemini.side_effect = Exception("API timeout")
+        result = zunda_hook.zundamon_answer("test question")
+        self.assertEqual(mock_gemini.call_count, 1)
+        self.assertIn("うまく答えられなかった", result)
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_critique_failure_uses_fallback(self, mock_gemini):
+        """If critique (step 2) fails, synthesis still runs with fallback text."""
+        mock_gemini.side_effect = [
+            "Draft answer",
+            Exception("API error"),
+            "最終回答なのだ！",
+        ]
+        result = zunda_hook.zundamon_answer("test question")
+        self.assertEqual(mock_gemini.call_count, 3)
+        # Verify fallback critique was used
+        synth_prompt = mock_gemini.call_args_list[2][0][0]
+        self.assertIn("検証できなかった", synth_prompt)
+        self.assertIn("なのだ", result)
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_synthesis_failure_returns_error(self, mock_gemini):
+        """If synthesis (step 3) fails, return error."""
+        mock_gemini.side_effect = [
+            "Draft answer",
+            "問題なし",
+            Exception("API error"),
+        ]
+        result = zunda_hook.zundamon_answer("test question")
+        self.assertEqual(mock_gemini.call_count, 3)
+        self.assertIn("うまく答えられなかった", result)
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "")
+    def test_no_api_key(self):
+        """Returns error if GEMINI_API_KEY is not set."""
+        result = zunda_hook.zundamon_answer("test")
+        self.assertIn("APIキー", result)
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_question_passed_to_all_steps(self, mock_gemini):
+        """The original question appears in all 3 prompts."""
+        mock_gemini.side_effect = ["draft", "critique", "final"]
+        zunda_hook.zundamon_answer("リスト内包表記とは")
+        for call in mock_gemini.call_args_list:
+            self.assertIn("リスト内包表記", call[0][0])
+
+
+class TestSummarizeWithMock(unittest.TestCase):
+    """Tests for zundamon_summarize."""
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_summarize_calls_gemini(self, mock_gemini):
+        mock_gemini.return_value = "ファイルを編集したのだ！"
+        result = zunda_hook.zundamon_summarize("User: edit file\nClaude: done")
+        self.assertEqual(mock_gemini.call_count, 1)
+        self.assertEqual(result, "ファイルを編集したのだ！")
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_summarize_api_error(self, mock_gemini):
+        mock_gemini.side_effect = Exception("timeout")
+        result = zunda_hook.zundamon_summarize("some text")
+        self.assertIn("エラー", result)
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "")
+    def test_summarize_no_api_key(self):
+        result = zunda_hook.zundamon_summarize("some text")
+        self.assertIn("APIキー", result)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,16 @@ Type `@zunda` followed by a question, and Zundamon will answer via voice.
 
 Prompts starting with `@zunda` are **not sent to Claude** (exit code 2). The Gemini + VOICEVOX pipeline runs in the background.
 
+### Debate Pipeline (Fact-Checking)
+
+Questions go through a 3-step pipeline to ensure accuracy:
+
+1. **Draft** — Gemini generates an initial answer (temperature 0.7)
+2. **Critique** — A second Gemini call fact-checks the draft, identifying inaccuracies or gaps (temperature 0.3)
+3. **Synthesize** — A third call produces the final Zundamon-style answer, incorporating corrections from the critique (temperature 0.5)
+
+If the critique step fails, synthesis proceeds with the original draft. If the draft step fails, an error is returned immediately.
+
 ## Concurrent Playback
 
 When multiple projects trigger speech simultaneously, a lock file serializes audio playback — no overlapping speech. Gemini API calls run in parallel; only playback is queued.
@@ -55,6 +65,7 @@ When multiple projects trigger speech simultaneously, a lock file serializes aud
 - **Full mode** on demand via `@zunda full` — sends entire conversation (up to 1M tokens)
 - **Status check** via `@zunda status`
 - **Configurable speech speed** (0.5x–2.0x) with validation
+- **3-step debate pipeline** for Q&A — Draft → Critique → Synthesize
 
 ## Requirements
 
@@ -131,7 +142,7 @@ This will automatically start the VOICEVOX Docker container if needed.
 python3 test_logic.py -v
 ```
 
-Covers transcript parsing, delta offset tracking, project activation, command dispatch, and speed validation (31 tests).
+Covers transcript parsing, delta offset tracking, project activation, command dispatch, speed validation, debate pipeline, and summarization (41 tests).
 
 ### Integration tests (requires Gemini API key and/or VOICEVOX)
 
@@ -172,7 +183,7 @@ Customize via `.env` or environment variables:
 ```
 VoicevoxClaudeCode/
 ├── zunda_hook.py    # Main hook script
-├── test_logic.py    # Unit tests (31 tests, no API needed)
+├── test_logic.py    # Unit tests (41 tests, no API needed)
 ├── test_hook.py     # Integration tests (requires APIs)
 ├── .env             # API keys and settings (git-ignored)
 ├── .env.example     # Template for .env
