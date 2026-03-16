@@ -41,12 +41,16 @@ load_env()
 
 # === Configuration ===
 VOICEVOX_HOST = os.environ.get("VOICEVOX_HOST", "http://localhost:50021")
-VOICEVOX_SPEAKER = int(os.environ.get("VOICEVOX_SPEAKER", "3"))
+VOICEVOX_SPEAKER = max(0, int(os.environ.get("VOICEVOX_SPEAKER", "3")))
+VOICEVOX_SPEED = min(2.0, max(0.5, float(os.environ.get("VOICEVOX_SPEED", "1.4"))))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 LOG_FILE = os.path.join(SCRIPT_DIR, "zunda_hook.log")
 LOCK_FILE = os.path.join(SCRIPT_DIR, ".voicevox.lock")
 ACTIVE_PROJECTS_FILE = os.path.join(SCRIPT_DIR, ".active_projects")
+TRANSCRIPT_OFFSETS_FILE = os.path.join(SCRIPT_DIR, ".transcript_offsets")
+FULL_FLAG_FILE = os.path.join(SCRIPT_DIR, ".next_full")
+MAX_CONVERSATION_CHARS = 3000000  # ~1M tokens for Gemini
 ZUNDAMON_PREFIX = "@zunda "
 
 
@@ -57,15 +61,15 @@ def zundamon_summarize(text: str) -> str:
 
     prompt = (
         "あなたは「ずんだもん」です。東北地方の妖精で、語尾に「なのだ」「のだ」をつけて話します。\n"
-        "以下はAIアシスタント(Claude)がユーザーに返した最後のメッセージです。\n"
-        "Claudeが何をしたか・何を報告しているかを読み取って、**開発の進捗を80文字〜150文字程度で要約報告**してください。\n"
+        "以下はAIアシスタント(Claude)と開発者の会話全体です。\n"
+        "この会話を読んで、**Claudeが何をしたか・何が決まったか・何が変わったかを具体的に、100文字〜200文字程度で要約報告**してください。\n"
         "ルール:\n"
         "- 語尾は「なのだ」「のだ」「だよ」を使う\n"
         "- ファイル名や機能名など具体的な内容を含めること\n"
         "- 技術用語はそのまま使ってOK\n"
         "- 明るく元気な口調で\n"
         "- 余計な前置きは不要。報告文だけ出力すること\n\n"
-        f"Claudeのメッセージ:\n{text[:1000]}"
+        f"会話:\n{text}"
     )
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -145,7 +149,7 @@ def _play_voicevox(text: str) -> None:
         print(f"[zunda_hook] VOICEVOX audio_query failed: {e}", file=sys.stderr)
         return
 
-    query_data["speedScale"] = 1.4
+    query_data["speedScale"] = VOICEVOX_SPEED
     query_json = json.dumps(query_data).encode("utf-8")
 
     synth_url = f"{VOICEVOX_HOST}/synthesis?speaker={VOICEVOX_SPEAKER}"
@@ -290,6 +294,37 @@ def main():
             )
             print("Zundamon OFF!", file=sys.stderr)
             sys.exit(2)
+        if prompt == "@zunda status":
+            active = is_project_active(cwd)
+            # Check VOICEVOX
+            voicevox_ok = False
+            try:
+                req = urllib.request.Request(f"{VOICEVOX_HOST}/version")
+                with urllib.request.urlopen(req, timeout=2):
+                    voicevox_ok = True
+            except Exception:
+                pass
+            # List all active projects
+            all_projects = []
+            if os.path.exists(ACTIVE_PROJECTS_FILE):
+                with open(ACTIVE_PROJECTS_FILE, "r") as f:
+                    all_projects = [l.strip() for l in f if l.strip()]
+            status = (
+                f"Zundamon: {'ON' if active else 'OFF'} (this project)\n"
+                f"VOICEVOX: {'Running' if voicevox_ok else 'Not running'} ({VOICEVOX_HOST})\n"
+                f"Gemini:   {'Configured' if GEMINI_API_KEY else 'No API key'} ({GEMINI_MODEL})\n"
+                f"Speaker:  {VOICEVOX_SPEAKER}\n"
+                f"Speed:    {VOICEVOX_SPEED}x\n"
+                f"Active projects: {', '.join(all_projects) if all_projects else '(none)'}"
+            )
+            print(status, file=sys.stderr)
+            sys.exit(2)
+        if prompt == "@zunda full":
+            # Set flag so the next Stop hook sends the full transcript
+            with open(FULL_FLAG_FILE, "w") as f:
+                f.write(cwd)
+            print("Next report will include the full conversation.", file=sys.stderr)
+            sys.exit(2)
         if prompt == "/exit" and is_project_active(cwd):
             deactivate_project(cwd)
             log(f"Project auto-deactivated on /exit: {cwd}")
@@ -302,7 +337,17 @@ def main():
     if event_name == "UserPromptSubmit":
         handle_user_prompt(hook_input)
     elif event_name == "Stop":
-        handle_stop(hook_input)
+        # Check if @zunda full was requested
+        full = False
+        if os.path.exists(FULL_FLAG_FILE):
+            try:
+                with open(FULL_FLAG_FILE, "r") as f:
+                    if f.read().strip() == cwd:
+                        full = True
+                os.unlink(FULL_FLAG_FILE)
+            except OSError:
+                pass
+        handle_stop(hook_input, full=full)
     else:
         log(f"Unhandled event: {event_name}")
 
@@ -328,30 +373,126 @@ def handle_user_prompt(hook_input: dict):
     sys.exit(2)
 
 
-def handle_stop(hook_input: dict):
-    """Handle Stop: summarize what Claude did and speak it."""
-    # skip if stop hook is already active (prevent loops)
+def _load_offsets() -> dict:
+    """Load transcript byte offsets from file."""
+    if not os.path.exists(TRANSCRIPT_OFFSETS_FILE):
+        return {}
+    with open(TRANSCRIPT_OFFSETS_FILE, "r") as f:
+        try:
+            return json.loads(f.read())
+        except json.JSONDecodeError:
+            return {}
+
+
+def _save_offsets(offsets: dict) -> None:
+    """Save transcript byte offsets to file."""
+    with open(TRANSCRIPT_OFFSETS_FILE, "w") as f:
+        f.write(json.dumps(offsets))
+
+
+def _parse_transcript_lines(lines: list[str]) -> str:
+    """Parse JSONL lines into readable conversation text."""
+    messages = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        msg_type = obj.get("type")
+        if msg_type not in ("user", "assistant"):
+            continue
+
+        content_blocks = obj.get("message", {}).get("content", [])
+        texts = []
+        for block in content_blocks:
+            if block.get("type") == "text":
+                text = block["text"]
+                if text.startswith("[Request interrupted") or text.startswith("The user doesn't want"):
+                    continue
+                texts.append(text)
+
+        if texts:
+            role = "User" if msg_type == "user" else "Claude"
+            messages.append(f"{role}: {' '.join(texts)}")
+
+    return "\n".join(messages)
+
+
+def read_transcript(transcript_path: str, full: bool = False) -> str:
+    """Read the JSONL transcript and extract user/assistant text messages.
+
+    Args:
+        transcript_path: Path to the JSONL transcript file.
+        full: If True, read the entire transcript. If False, read only new
+              lines since the last read (delta mode).
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return ""
+
+    offsets = _load_offsets()
+    last_offset = offsets.get(transcript_path, 0) if not full else 0
+
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        if last_offset > 0:
+            f.seek(last_offset)
+        lines = f.readlines()
+        new_offset = f.tell()
+
+    # Save new offset
+    offsets[transcript_path] = new_offset
+    _save_offsets(offsets)
+
+    result = _parse_transcript_lines(lines)
+    if len(result) > MAX_CONVERSATION_CHARS:
+        result = result[-MAX_CONVERSATION_CHARS:]
+    return result
+
+
+def handle_stop(hook_input: dict, full: bool = False):
+    """Handle Stop: summarize the conversation and speak it."""
     if hook_input.get("stop_hook_active"):
         log("stop_hook_active=true, skipping")
         return
 
-    last_message = hook_input.get("last_assistant_message", "")
-    if not last_message:
-        log("No last_assistant_message, skipping")
+    transcript_path = hook_input.get("transcript_path", "")
+    conversation = read_transcript(transcript_path, full=full)
+    if not conversation:
+        conversation = hook_input.get("last_assistant_message", "")
+    if not conversation:
+        log("No conversation found, skipping")
         return
 
-    log(f"Stop: last_message length={len(last_message)}")
+    mode = "full" if full else "delta"
+    log(f"Stop ({mode}): conversation length={len(conversation)}")
 
-    # Summarize and speak in background
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, encoding="utf-8"
+    )
+    tmp.write(conversation)
+    tmp.close()
+
     subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "--summarize", last_message[:2000]],
+        [sys.executable, os.path.abspath(__file__), "--summarize-file", tmp.name],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
 
-def run_summarize_mode(text: str):
-    """Background mode: summarize text and play speech."""
+def run_summarize_mode(text_file: str):
+    """Background mode: read conversation from file, summarize, and speak."""
+    try:
+        with open(text_file, "r", encoding="utf-8") as f:
+            text = f.read()
+    finally:
+        try:
+            os.unlink(text_file)
+        except OSError:
+            pass
+
     zunda_text = zundamon_summarize(text)
     log(f"zunda_text: {zunda_text}")
     speak_voicevox(zunda_text)
@@ -369,7 +510,7 @@ def run_answer_mode(question: str):
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--answer":
         run_answer_mode(sys.argv[2])
-    elif len(sys.argv) >= 3 and sys.argv[1] == "--summarize":
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--summarize-file":
         run_summarize_mode(sys.argv[2])
     else:
         main()

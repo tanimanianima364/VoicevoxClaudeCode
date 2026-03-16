@@ -4,26 +4,29 @@ Zundamon voice-reports development progress when Claude Code finishes a response
 
 ## How It Works
 
-Uses Claude Code's **Stop hook** to summarize what Claude did at the end of each turn.
+Uses Claude Code's **Stop hook** to read the full conversation transcript and summarize what Claude did.
 
 ```
 Claude Code finishes responding (Stop hook fires)
   ↓
-zunda_hook.py receives last_assistant_message
+zunda_hook.py reads the conversation transcript (delta since last report)
   ↓
-Gemini API summarizes it in Zundamon's speaking style
+Gemini API (1M token context) summarizes it in Zundamon's speaking style
   ↓
 VOICEVOX synthesizes speech → plays audio
 ```
 
-## Project Control
+By default, only **new messages since the last report** are sent to Gemini (delta mode). Use `@zunda full` to include the entire conversation in the next report.
 
-Disabled by default. Enable per project directory with `@zunda on` in any Claude Code session.
+## Commands
 
 | Command | Action |
 |---|---|
 | `@zunda on` | Enable Zundamon for this project (auto-starts VOICEVOX Docker container) |
 | `@zunda off` | Disable Zundamon for this project |
+| `@zunda full` | Next report includes the full conversation (one-shot) |
+| `@zunda status` | Show current status (project, VOICEVOX, Gemini, speaker, speed) |
+| `@zunda <question>` | Ask Zundamon a question (answered via voice) |
 | `/exit` | Automatically disables Zundamon for this project |
 
 Managed per project directory (cwd), so enabling in one project does not affect others. Persists across session changes within the same directory.
@@ -48,6 +51,10 @@ When multiple projects trigger speech simultaneously, a lock file serializes aud
 - Globally registered in `~/.claude/settings.json` — works in any directory
 - **Opt-in per project** via `@zunda on` (default: OFF)
 - **Auto-starts VOICEVOX** Docker container on `@zunda on` if not running
+- **Delta mode** by default — only new messages since last report are sent to Gemini
+- **Full mode** on demand via `@zunda full` — sends entire conversation (up to 1M tokens)
+- **Status check** via `@zunda status`
+- **Configurable speech speed** (0.5x–2.0x) with validation
 
 ## Requirements
 
@@ -142,12 +149,13 @@ python3 test_hook.py --full
 
 Customize via `.env` or environment variables:
 
-| Variable | Default | Description |
-|---|---|---|
-| `GEMINI_API_KEY` | (required) | Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model to use |
-| `VOICEVOX_HOST` | `http://localhost:50021` | VOICEVOX engine URL |
-| `VOICEVOX_SPEAKER` | `3` | Speaker ID (3 = Zundamon Normal) |
+| Variable | Default | Range | Description |
+|---|---|---|---|
+| `GEMINI_API_KEY` | (required) | | Gemini API key |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | | Gemini model to use |
+| `VOICEVOX_HOST` | `http://localhost:50021` | | VOICEVOX engine URL |
+| `VOICEVOX_SPEAKER` | `3` | >= 0 | Speaker ID (3 = Zundamon Normal) |
+| `VOICEVOX_SPEED` | `1.4` | 0.5–2.0 | Speech speed multiplier |
 
 ## File Structure
 
