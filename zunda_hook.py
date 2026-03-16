@@ -9,6 +9,7 @@ UserPromptSubmit: Answers @zunda questions via Gemini + VOICEVOX.
 import json
 import sys
 import os
+import fcntl
 import subprocess
 import tempfile
 import urllib.request
@@ -45,6 +46,11 @@ VOICEVOX_SPEAKER = int(os.environ.get("VOICEVOX_SPEAKER", "3"))  # 3 = Zundamon 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 LOG_FILE = os.path.join(SCRIPT_DIR, "zunda_hook.log")
+LOCK_FILE = os.path.join(SCRIPT_DIR, ".voicevox.lock")
+ACTIVE_SESSIONS_FILE = os.path.join(SCRIPT_DIR, ".active_sessions")
+EDIT_QUEUE_FILE = os.path.join(SCRIPT_DIR, ".edit_queue")
+BATCH_DELAY_SEC = 3  # 新しい編集がこの秒数来なければバッチ処理
+BATCH_MAX_EDITS = 5  # この件数溜まったら即座にバッチ処理
 ZUNDAMON_PREFIX = "@zunda "
 
 
@@ -114,16 +120,41 @@ def zundamon_answer(question: str) -> str:
 
 
 def speak_voicevox(text: str) -> None:
-    """Synthesize and play speech via VOICEVOX."""
+    """Synthesize and play speech via VOICEVOX.
+
+    Uses a lock file to serialize audio playback.
+    If another instance is playing, waits for it to finish first.
+    """
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except Exception as e:
+        log(f"Lock error: {e}")
+        lock_fd.close()
+        return
+
+    try:
+        _play_voicevox(text)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def _play_voicevox(text: str) -> None:
+    """Internal: synthesize and play audio (called with lock held)."""
     # 1. Generate audio query
     query_url = f"{VOICEVOX_HOST}/audio_query?text={urllib.parse.quote(text)}&speaker={VOICEVOX_SPEAKER}"
     req = urllib.request.Request(query_url, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            query_json = resp.read()
+            query_data = json.loads(resp.read())
     except Exception as e:
         print(f"[zunda_hook] VOICEVOX audio_query failed: {e}", file=sys.stderr)
         return
+
+    # 1.5. Adjust speech speed
+    query_data["speedScale"] = 1.4
+    query_json = json.dumps(query_data).encode("utf-8")
 
     # 2. Synthesize audio
     synth_url = f"{VOICEVOX_HOST}/synthesis?speaker={VOICEVOX_SPEAKER}"
@@ -168,6 +199,36 @@ def log(msg: str) -> None:
         f.write(f"[{ts}] {msg}\n")
 
 
+def is_session_active(session_id: str) -> bool:
+    """Check if the session is in the active sessions list."""
+    if not session_id or not os.path.exists(ACTIVE_SESSIONS_FILE):
+        return False
+    with open(ACTIVE_SESSIONS_FILE, "r") as f:
+        return session_id in f.read().splitlines()
+
+
+def activate_session(session_id: str) -> None:
+    """Add session_id to the active sessions file."""
+    sessions = set()
+    if os.path.exists(ACTIVE_SESSIONS_FILE):
+        with open(ACTIVE_SESSIONS_FILE, "r") as f:
+            sessions = set(line.strip() for line in f if line.strip())
+    sessions.add(session_id)
+    with open(ACTIVE_SESSIONS_FILE, "w") as f:
+        f.write("\n".join(sessions) + "\n")
+
+
+def deactivate_session(session_id: str) -> None:
+    """Remove session_id from the active sessions file."""
+    if not os.path.exists(ACTIVE_SESSIONS_FILE):
+        return
+    with open(ACTIVE_SESSIONS_FILE, "r") as f:
+        sessions = set(line.strip() for line in f if line.strip())
+    sessions.discard(session_id)
+    with open(ACTIVE_SESSIONS_FILE, "w") as f:
+        f.write("\n".join(sessions) + "\n") if sessions else None
+
+
 def main():
     """Read hook input from stdin and dispatch to the appropriate handler."""
     try:
@@ -178,7 +239,36 @@ def main():
         log(f"stdin parse error: {e}")
         return
 
+    # @zunda on/off はセッション有効化の前にチェック
     event_name = hook_input.get("hook_event_name", "")
+    session_id = hook_input.get("session_id", "")
+
+    if event_name == "UserPromptSubmit":
+        prompt = hook_input.get("prompt", "").strip()
+        if prompt == "@zunda on":
+            activate_session(session_id)
+            log(f"Session activated: {session_id}")
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--answer", "ずんだもん、起動したのだ！よろしくなのだ！"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            print("Zundamon ON!", file=sys.stderr)
+            sys.exit(2)
+        if prompt == "@zunda off":
+            deactivate_session(session_id)
+            log(f"Session deactivated: {session_id}")
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--answer", "ずんだもん、おやすみなのだ！またね！"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            print("Zundamon OFF!", file=sys.stderr)
+            sys.exit(2)
+
+    # このセッションが有効でなければスキップ
+    if not is_session_active(session_id):
+        return
 
     if event_name == "UserPromptSubmit":
         handle_user_prompt(hook_input)
@@ -230,7 +320,7 @@ def run_answer_mode(question: str):
 
 
 def handle_post_tool_use(hook_input: dict):
-    """Handle PostToolUse: report file edit progress."""
+    """Handle PostToolUse: queue edit info and spawn batch processor."""
     tool_name = hook_input.get("tool_name", "")
     tool_input = hook_input.get("tool_input", {})
 
@@ -243,27 +333,91 @@ def handle_post_tool_use(hook_input: dict):
     if tool_name == "Edit":
         old_str = tool_input.get("old_string", "")[:100]
         new_str = tool_input.get("new_string", "")[:100]
-        conversation = f"Edited {file_path}: '{old_str}' -> '{new_str}'"
+        entry = f"Edited {file_path}: '{old_str}' -> '{new_str}'"
     elif tool_name == "Write":
         content_preview = tool_input.get("content", "")[:150]
-        conversation = f"Created {file_path}: {content_preview}"
+        entry = f"Created {file_path}: {content_preview}"
     else:
         log(f"Unexpected tool: {tool_name}, skipping")
         return
 
-    log(f"conversation: {conversation[:200]}")
+    # Append to queue file (with file lock for concurrent safety)
+    queue_fd = open(EDIT_QUEUE_FILE, "a")
+    try:
+        fcntl.flock(queue_fd, fcntl.LOCK_EX)
+        queue_fd.write(entry + "\n")
+        queue_fd.flush()
+    finally:
+        fcntl.flock(queue_fd, fcntl.LOCK_UN)
+        queue_fd.close()
 
-    # Convert to Zundamon style
+    log(f"Queued: {entry[:100]}")
+
+    # Spawn batch processor in background (debounce: waits BATCH_DELAY_SEC)
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--batch"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _queue_line_count():
+    """Return the number of lines in the edit queue (without locking)."""
+    try:
+        with open(EDIT_QUEUE_FILE, "r") as f:
+            return sum(1 for line in f if line.strip())
+    except FileNotFoundError:
+        return 0
+
+
+def run_batch_mode():
+    """Background mode: wait for edits to settle or threshold, then report."""
+    import time
+
+    # Poll: wait up to BATCH_DELAY_SEC, but fire early if queue reaches threshold
+    elapsed = 0.0
+    interval = 0.3
+    while elapsed < BATCH_DELAY_SEC:
+        if _queue_line_count() >= BATCH_MAX_EDITS:
+            log(f"Batch: threshold {BATCH_MAX_EDITS} reached, processing early")
+            break
+        time.sleep(interval)
+        elapsed += interval
+
+    # Atomically read and clear the queue
+    queue_fd = open(EDIT_QUEUE_FILE, "r+")
+    try:
+        fcntl.flock(queue_fd, fcntl.LOCK_EX)
+        entries = queue_fd.read().strip()
+        if not entries:
+            log("Batch: queue empty, skipping")
+            return
+        # Clear the file
+        queue_fd.seek(0)
+        queue_fd.truncate(0)
+    finally:
+        fcntl.flock(queue_fd, fcntl.LOCK_UN)
+        queue_fd.close()
+
+    lines = entries.splitlines()
+    log(f"Batch: processing {len(lines)} edits")
+
+    # Summarize all edits together
+    conversation = "\n".join(lines)
     zunda_text = zundamon_summarize(conversation)
-    log(f"zunda_text: {zunda_text}")
+    log(f"Batch zunda_text: {zunda_text}")
 
     # Play via VOICEVOX
     speak_voicevox(zunda_text)
-    log("done")
+    log("Batch done")
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--answer":
         run_answer_mode(sys.argv[2])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--batch":
+        run_batch_mode()
     else:
         main()
