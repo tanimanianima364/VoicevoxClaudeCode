@@ -2,8 +2,8 @@
 """
 Claude Code Hook -> Zundamon progress reporter & Q&A.
 
-PostToolUse: Reports file edit progress via VOICEVOX speech.
-UserPromptSubmit: Answers @zunda questions via Gemini + VOICEVOX.
+Stop: Summarizes what Claude did and reports via VOICEVOX speech.
+UserPromptSubmit: Handles @zunda on/off/questions.
 """
 
 import json
@@ -33,7 +33,6 @@ def load_env():
             key, _, value = line.partition("=")
             key = key.strip()
             value = value.strip()
-            # Existing env vars take precedence
             if key and key not in os.environ:
                 os.environ[key] = value
 
@@ -42,38 +41,37 @@ load_env()
 
 # === Configuration ===
 VOICEVOX_HOST = os.environ.get("VOICEVOX_HOST", "http://localhost:50021")
-VOICEVOX_SPEAKER = int(os.environ.get("VOICEVOX_SPEAKER", "3"))  # 3 = Zundamon (Normal)
+VOICEVOX_SPEAKER = int(os.environ.get("VOICEVOX_SPEAKER", "3"))
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 LOG_FILE = os.path.join(SCRIPT_DIR, "zunda_hook.log")
 LOCK_FILE = os.path.join(SCRIPT_DIR, ".voicevox.lock")
-ACTIVE_SESSIONS_FILE = os.path.join(SCRIPT_DIR, ".active_sessions")
-EDIT_QUEUE_FILE = os.path.join(SCRIPT_DIR, ".edit_queue")
-BATCH_DELAY_SEC = 3  # 新しい編集がこの秒数来なければバッチ処理
-BATCH_MAX_EDITS = 5  # この件数溜まったら即座にバッチ処理
+ACTIVE_PROJECTS_FILE = os.path.join(SCRIPT_DIR, ".active_projects")
 ZUNDAMON_PREFIX = "@zunda "
 
 
-def zundamon_summarize(conversation: str) -> str:
-    """Summarize a conversation in Zundamon's speaking style via Gemini API."""
+def zundamon_summarize(text: str) -> str:
+    """Summarize Claude's work in Zundamon's speaking style via Gemini API."""
     if not GEMINI_API_KEY:
-        return "Gemini APIキーが設定されてないのだ！GEMINI_API_KEY環境変数を設定するのだ！"
+        return "Gemini APIキーが設定されてないのだ！"
 
     prompt = (
         "あなたは「ずんだもん」です。東北地方の妖精で、語尾に「なのだ」「のだ」をつけて話します。\n"
-        "以下のAIアシスタント(Claude)と開発者の会話を読んで、**開発の進捗を30文字〜80文字程度で短く報告**してください。\n"
+        "以下はAIアシスタント(Claude)がユーザーに返した最後のメッセージです。\n"
+        "Claudeが何をしたか・何を報告しているかを読み取って、**開発の進捗を80文字〜150文字程度で要約報告**してください。\n"
         "ルール:\n"
         "- 語尾は「なのだ」「のだ」「だよ」を使う\n"
+        "- ファイル名や機能名など具体的な内容を含めること\n"
         "- 技術用語はそのまま使ってOK\n"
         "- 明るく元気な口調で\n"
-        "- 余計な説明や前置きは不要。報告文だけ出力すること\n\n"
-        f"会話内容:\n{conversation}"
+        "- 余計な前置きは不要。報告文だけ出力すること\n\n"
+        f"Claudeのメッセージ:\n{text[:1000]}"
     )
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 150, "temperature": 0.8},
+        "generationConfig": {"maxOutputTokens": 300, "temperature": 0.8},
     }).encode("utf-8")
 
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
@@ -120,11 +118,7 @@ def zundamon_answer(question: str) -> str:
 
 
 def speak_voicevox(text: str) -> None:
-    """Synthesize and play speech via VOICEVOX.
-
-    Uses a lock file to serialize audio playback.
-    If another instance is playing, waits for it to finish first.
-    """
+    """Synthesize and play speech via VOICEVOX with lock serialization."""
     lock_fd = open(LOCK_FILE, "w")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -142,7 +136,6 @@ def speak_voicevox(text: str) -> None:
 
 def _play_voicevox(text: str) -> None:
     """Internal: synthesize and play audio (called with lock held)."""
-    # 1. Generate audio query
     query_url = f"{VOICEVOX_HOST}/audio_query?text={urllib.parse.quote(text)}&speaker={VOICEVOX_SPEAKER}"
     req = urllib.request.Request(query_url, method="POST")
     try:
@@ -152,17 +145,13 @@ def _play_voicevox(text: str) -> None:
         print(f"[zunda_hook] VOICEVOX audio_query failed: {e}", file=sys.stderr)
         return
 
-    # 1.5. Adjust speech speed
     query_data["speedScale"] = 1.4
     query_json = json.dumps(query_data).encode("utf-8")
 
-    # 2. Synthesize audio
     synth_url = f"{VOICEVOX_HOST}/synthesis?speaker={VOICEVOX_SPEAKER}"
     req = urllib.request.Request(
-        synth_url,
-        data=query_json,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        synth_url, data=query_json,
+        headers={"Content-Type": "application/json"}, method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -171,7 +160,6 @@ def _play_voicevox(text: str) -> None:
         print(f"[zunda_hook] VOICEVOX synthesis failed: {e}", file=sys.stderr)
         return
 
-    # 3. Play audio (fallback chain: aplay -> paplay -> ffplay)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(wav_data)
         tmp_path = tmp.name
@@ -199,38 +187,74 @@ def log(msg: str) -> None:
         f.write(f"[{ts}] {msg}\n")
 
 
-def is_session_active(session_id: str) -> bool:
-    """Check if the session is in the active sessions list."""
-    if not session_id or not os.path.exists(ACTIVE_SESSIONS_FILE):
+def ensure_voicevox() -> None:
+    """Ensure VOICEVOX engine is running. Start Docker container if needed."""
+    # Check if already accessible
+    try:
+        req = urllib.request.Request(f"{VOICEVOX_HOST}/version")
+        with urllib.request.urlopen(req, timeout=2):
+            return  # Already running
+    except Exception:
+        pass
+
+    # Try starting existing container
+    log("VOICEVOX not running, attempting docker start...")
+    result = subprocess.run(
+        ["docker", "start", "voicevox"],
+        capture_output=True, timeout=10,
+    )
+    if result.returncode != 0:
+        # Container doesn't exist, create it
+        log("Container not found, creating...")
+        subprocess.run(
+            ["docker", "run", "-d", "--name", "voicevox",
+             "-p", "50021:50021",
+             "voicevox/voicevox_engine:cpu-ubuntu20.04-latest"],
+            capture_output=True, timeout=120,
+        )
+
+    # Wait for VOICEVOX to become ready (up to 30s)
+    import time
+    for _ in range(30):
+        try:
+            req = urllib.request.Request(f"{VOICEVOX_HOST}/version")
+            with urllib.request.urlopen(req, timeout=2):
+                log("VOICEVOX is ready")
+                return
+        except Exception:
+            time.sleep(1)
+    log("VOICEVOX failed to start within 30s")
+
+
+def is_project_active(cwd: str) -> bool:
+    if not cwd or not os.path.exists(ACTIVE_PROJECTS_FILE):
         return False
-    with open(ACTIVE_SESSIONS_FILE, "r") as f:
-        return session_id in f.read().splitlines()
+    with open(ACTIVE_PROJECTS_FILE, "r") as f:
+        return cwd in f.read().splitlines()
 
 
-def activate_session(session_id: str) -> None:
-    """Add session_id to the active sessions file."""
-    sessions = set()
-    if os.path.exists(ACTIVE_SESSIONS_FILE):
-        with open(ACTIVE_SESSIONS_FILE, "r") as f:
-            sessions = set(line.strip() for line in f if line.strip())
-    sessions.add(session_id)
-    with open(ACTIVE_SESSIONS_FILE, "w") as f:
-        f.write("\n".join(sessions) + "\n")
+def activate_project(cwd: str) -> None:
+    projects = set()
+    if os.path.exists(ACTIVE_PROJECTS_FILE):
+        with open(ACTIVE_PROJECTS_FILE, "r") as f:
+            projects = set(line.strip() for line in f if line.strip())
+    projects.add(cwd)
+    with open(ACTIVE_PROJECTS_FILE, "w") as f:
+        f.write("\n".join(projects) + "\n")
 
 
-def deactivate_session(session_id: str) -> None:
-    """Remove session_id from the active sessions file."""
-    if not os.path.exists(ACTIVE_SESSIONS_FILE):
+def deactivate_project(cwd: str) -> None:
+    if not os.path.exists(ACTIVE_PROJECTS_FILE):
         return
-    with open(ACTIVE_SESSIONS_FILE, "r") as f:
-        sessions = set(line.strip() for line in f if line.strip())
-    sessions.discard(session_id)
-    with open(ACTIVE_SESSIONS_FILE, "w") as f:
-        f.write("\n".join(sessions) + "\n") if sessions else None
+    with open(ACTIVE_PROJECTS_FILE, "r") as f:
+        projects = set(line.strip() for line in f if line.strip())
+    projects.discard(cwd)
+    with open(ACTIVE_PROJECTS_FILE, "w") as f:
+        f.write("\n".join(projects) + "\n") if projects else None
 
 
 def main():
-    """Read hook input from stdin and dispatch to the appropriate handler."""
+    """Read hook input from stdin and dispatch."""
     try:
         raw = sys.stdin.read()
         log(f"stdin: {raw[:500]}")
@@ -239,15 +263,16 @@ def main():
         log(f"stdin parse error: {e}")
         return
 
-    # @zunda on/off はセッション有効化の前にチェック
     event_name = hook_input.get("hook_event_name", "")
-    session_id = hook_input.get("session_id", "")
+    cwd = hook_input.get("cwd", "")
 
+    # @zunda on/off / /exit — check before project active gate
     if event_name == "UserPromptSubmit":
         prompt = hook_input.get("prompt", "").strip()
         if prompt == "@zunda on":
-            activate_session(session_id)
-            log(f"Session activated: {session_id}")
+            ensure_voicevox()
+            activate_project(cwd)
+            log(f"Project activated: {cwd}")
             subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__), "--answer", "ずんだもん、起動したのだ！よろしくなのだ！"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -256,8 +281,8 @@ def main():
             print("Zundamon ON!", file=sys.stderr)
             sys.exit(2)
         if prompt == "@zunda off":
-            deactivate_session(session_id)
-            log(f"Session deactivated: {session_id}")
+            deactivate_project(cwd)
+            log(f"Project deactivated: {cwd}")
             subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__), "--answer", "ずんだもん、おやすみなのだ！またね！"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -265,50 +290,72 @@ def main():
             )
             print("Zundamon OFF!", file=sys.stderr)
             sys.exit(2)
+        if prompt == "/exit" and is_project_active(cwd):
+            deactivate_project(cwd)
+            log(f"Project auto-deactivated on /exit: {cwd}")
+            return
 
-    # このセッションが有効でなければスキップ
-    if not is_session_active(session_id):
+    # Skip if project not active
+    if not is_project_active(cwd):
         return
 
     if event_name == "UserPromptSubmit":
         handle_user_prompt(hook_input)
-    elif event_name == "PostToolUse":
-        handle_post_tool_use(hook_input)
+    elif event_name == "Stop":
+        handle_stop(hook_input)
     else:
-        log(f"Unknown event: {event_name}, skipping")
+        log(f"Unhandled event: {event_name}")
 
 
 def handle_user_prompt(hook_input: dict):
     """Handle UserPromptSubmit: answer @zunda questions."""
     user_prompt = hook_input.get("prompt", "")
-    if not user_prompt:
-        log("No prompt field, skipping")
-        return
-
-    # Check for @zunda prefix; return immediately if not matched
-    if not user_prompt.startswith(ZUNDAMON_PREFIX):
+    if not user_prompt or not user_prompt.startswith(ZUNDAMON_PREFIX):
         return
 
     question = user_prompt[len(ZUNDAMON_PREFIX):].strip()
     if not question:
-        log("Empty question after @zunda, skipping")
         print("Enter a question! e.g. @zunda What is Python?", file=sys.stderr)
         sys.exit(2)
 
     log(f"zundamon question: {question[:200]}")
-
-    # Run Gemini + VOICEVOX in background, return immediately
     subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--answer", question],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    print("Zundamon is thinking...", file=sys.stderr)
+    sys.exit(2)
+
+
+def handle_stop(hook_input: dict):
+    """Handle Stop: summarize what Claude did and speak it."""
+    # skip if stop hook is already active (prevent loops)
+    if hook_input.get("stop_hook_active"):
+        log("stop_hook_active=true, skipping")
+        return
+
+    last_message = hook_input.get("last_assistant_message", "")
+    if not last_message:
+        log("No last_assistant_message, skipping")
+        return
+
+    log(f"Stop: last_message length={len(last_message)}")
+
+    # Summarize and speak in background
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--summarize", last_message[:2000]],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
-    # Block the prompt from being sent to Claude via exit code 2
-    print("Zundamon is thinking...", file=sys.stderr)
-    sys.exit(2)
+
+def run_summarize_mode(text: str):
+    """Background mode: summarize text and play speech."""
+    zunda_text = zundamon_summarize(text)
+    log(f"zunda_text: {zunda_text}")
+    speak_voicevox(zunda_text)
+    log("done (stop summary)")
 
 
 def run_answer_mode(question: str):
@@ -319,105 +366,10 @@ def run_answer_mode(question: str):
     log("done (user prompt Q&A)")
 
 
-def handle_post_tool_use(hook_input: dict):
-    """Handle PostToolUse: queue edit info and spawn batch processor."""
-    tool_name = hook_input.get("tool_name", "")
-    tool_input = hook_input.get("tool_input", {})
-
-    if not tool_name:
-        log("No tool_name, skipping")
-        return
-
-    # Build summary text from edit details
-    file_path = tool_input.get("file_path", "unknown file")
-    if tool_name == "Edit":
-        old_str = tool_input.get("old_string", "")[:100]
-        new_str = tool_input.get("new_string", "")[:100]
-        entry = f"Edited {file_path}: '{old_str}' -> '{new_str}'"
-    elif tool_name == "Write":
-        content_preview = tool_input.get("content", "")[:150]
-        entry = f"Created {file_path}: {content_preview}"
-    else:
-        log(f"Unexpected tool: {tool_name}, skipping")
-        return
-
-    # Append to queue file (with file lock for concurrent safety)
-    queue_fd = open(EDIT_QUEUE_FILE, "a")
-    try:
-        fcntl.flock(queue_fd, fcntl.LOCK_EX)
-        queue_fd.write(entry + "\n")
-        queue_fd.flush()
-    finally:
-        fcntl.flock(queue_fd, fcntl.LOCK_UN)
-        queue_fd.close()
-
-    log(f"Queued: {entry[:100]}")
-
-    # Spawn batch processor in background (debounce: waits BATCH_DELAY_SEC)
-    subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "--batch"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-
-def _queue_line_count():
-    """Return the number of lines in the edit queue (without locking)."""
-    try:
-        with open(EDIT_QUEUE_FILE, "r") as f:
-            return sum(1 for line in f if line.strip())
-    except FileNotFoundError:
-        return 0
-
-
-def run_batch_mode():
-    """Background mode: wait for edits to settle or threshold, then report."""
-    import time
-
-    # Poll: wait up to BATCH_DELAY_SEC, but fire early if queue reaches threshold
-    elapsed = 0.0
-    interval = 0.3
-    while elapsed < BATCH_DELAY_SEC:
-        if _queue_line_count() >= BATCH_MAX_EDITS:
-            log(f"Batch: threshold {BATCH_MAX_EDITS} reached, processing early")
-            break
-        time.sleep(interval)
-        elapsed += interval
-
-    # Atomically read and clear the queue
-    queue_fd = open(EDIT_QUEUE_FILE, "r+")
-    try:
-        fcntl.flock(queue_fd, fcntl.LOCK_EX)
-        entries = queue_fd.read().strip()
-        if not entries:
-            log("Batch: queue empty, skipping")
-            return
-        # Clear the file
-        queue_fd.seek(0)
-        queue_fd.truncate(0)
-    finally:
-        fcntl.flock(queue_fd, fcntl.LOCK_UN)
-        queue_fd.close()
-
-    lines = entries.splitlines()
-    log(f"Batch: processing {len(lines)} edits")
-
-    # Summarize all edits together
-    conversation = "\n".join(lines)
-    zunda_text = zundamon_summarize(conversation)
-    log(f"Batch zunda_text: {zunda_text}")
-
-    # Play via VOICEVOX
-    speak_voicevox(zunda_text)
-    log("Batch done")
-
-
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--answer":
         run_answer_mode(sys.argv[2])
-    elif len(sys.argv) >= 2 and sys.argv[1] == "--batch":
-        run_batch_mode()
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--summarize":
+        run_summarize_mode(sys.argv[2])
     else:
         main()

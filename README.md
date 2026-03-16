@@ -1,33 +1,32 @@
 # VoicevoxClaudeCode
 
-A tool that makes Zundamon voice-report development progress whenever Claude Code edits files.
+Zundamon voice-reports development progress when Claude Code finishes a response.
 
 ## How It Works
 
-Uses Claude Code's **PostToolUse hook** to asynchronously run the following pipeline on each file edit (Edit/Write):
+Uses Claude Code's **Stop hook** to summarize what Claude did at the end of each turn.
 
 ```
-Claude Code edits a file (PostToolUse hook fires)
+Claude Code finishes responding (Stop hook fires)
   ↓
-zunda_hook.py receives edit details and adds to queue
+zunda_hook.py receives last_assistant_message
   ↓
-Batch processing: fires after 3s of inactivity or 5 queued edits
-  ↓
-Gemini API summarizes edits in Zundamon's speaking style
+Gemini API summarizes it in Zundamon's speaking style
   ↓
 VOICEVOX synthesizes speech → plays audio
 ```
 
-## Session Control
+## Project Control
 
-Disabled by default. Explicitly enable it per Claude Code session.
+Disabled by default. Enable per project directory with `@zunda on` in any Claude Code session.
 
 | Command | Action |
 |---|---|
-| `@zunda on` | Enable Zundamon for this session |
-| `@zunda off` | Disable Zundamon for this session |
+| `@zunda on` | Enable Zundamon for this project (auto-starts VOICEVOX Docker container) |
+| `@zunda off` | Disable Zundamon for this project |
+| `/exit` | Automatically disables Zundamon for this project |
 
-Managed per session ID, so it does not affect other Claude Code sessions running in different projects.
+Managed per project directory (cwd), so enabling in one project does not affect others. Persists across session changes within the same directory.
 
 ## Ask Zundamon a Question
 
@@ -39,25 +38,21 @@ Type `@zunda` followed by a question, and Zundamon will answer via voice.
 
 Prompts starting with `@zunda` are **not sent to Claude** (exit code 2). The Gemini + VOICEVOX pipeline runs in the background.
 
-## Batch Processing
+## Concurrent Playback
 
-Consecutive edits are batched into a single voice report.
-
-- **Time-based**: Reports after 3 seconds of no new edits
-- **Count-based**: Reports immediately when 5 edits accumulate
-
-When multiple sessions are active simultaneously, audio playback is serialized via a lock file — no overlapping speech.
+When multiple projects trigger speech simultaneously, a lock file serializes audio playback — no overlapping speech. Gemini API calls run in parallel; only playback is queued.
 
 ## Key Features
 
-- Registered with `async: true`, so it **does not slow down** Claude Code
-- Globally registered in `~/.claude/settings.json`, works in **any directory**
-- **Opt-in per session** via `@zunda on` (default: OFF)
+- **Stop hook** with `async: true` — does not slow down Claude Code
+- Globally registered in `~/.claude/settings.json` — works in any directory
+- **Opt-in per project** via `@zunda on` (default: OFF)
+- **Auto-starts VOICEVOX** Docker container on `@zunda on` if not running
 
 ## Requirements
 
 - Python 3
-- [VOICEVOX](https://voicevox.hiroshiba.jp/) (running locally, default `http://localhost:50021`)
+- Docker (for VOICEVOX engine)
 - [Gemini API key](https://aistudio.google.com/apikey)
 - An audio player (`aplay`, `paplay`, or `ffplay`)
 
@@ -75,26 +70,16 @@ Edit `.env` and set your Gemini API key:
 GEMINI_API_KEY=your-api-key-here
 ```
 
-### 2. Start VOICEVOX
+### 2. Configure Hooks
 
-Start the VOICEVOX engine so it is accessible at `http://localhost:50021`.
-
-With Docker:
-
-```bash
-docker run -d --name voicevox -p 50021:50021 voicevox/voicevox_engine:cpu-ubuntu20.04-latest
-```
-
-### 3. Configure Hooks
-
-Ensure `~/.claude/settings.json` contains the following:
+Add the following to `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "PostToolUse": [
+    "Stop": [
       {
-        "matcher": "Edit|Write",
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -120,6 +105,16 @@ Ensure `~/.claude/settings.json` contains the following:
   }
 }
 ```
+
+### 3. Enable in a project
+
+In any Claude Code session, type:
+
+```
+@zunda on
+```
+
+This will automatically start the VOICEVOX Docker container if needed.
 
 ## Testing
 

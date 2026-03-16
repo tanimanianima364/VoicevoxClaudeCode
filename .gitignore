@@ -4,5 +4,5 @@ __pycache__/
 *.wav
 zunda_hook.log
 .voicevox.lock
-.active_sessions
+.active_projects
 .edit_queue
