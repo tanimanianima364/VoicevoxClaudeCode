@@ -125,6 +125,16 @@ This will automatically start the VOICEVOX Docker container if needed.
 
 ## Testing
 
+### Unit tests (no external APIs required)
+
+```bash
+python3 test_logic.py -v
+```
+
+Covers transcript parsing, delta offset tracking, project activation, command dispatch, and speed validation (31 tests).
+
+### Integration tests (requires Gemini API key and/or VOICEVOX)
+
 ```bash
 # Test Gemini API summarization
 python3 test_hook.py
@@ -162,7 +172,8 @@ Customize via `.env` or environment variables:
 ```
 VoicevoxClaudeCode/
 ├── zunda_hook.py    # Main hook script
-├── test_hook.py     # Test script
+├── test_logic.py    # Unit tests (31 tests, no API needed)
+├── test_hook.py     # Integration tests (requires APIs)
 ├── .env             # API keys and settings (git-ignored)
 ├── .env.example     # Template for .env
 ├── LICENSE
