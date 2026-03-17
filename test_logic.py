@@ -294,35 +294,80 @@ class TestSpeedValidation(unittest.TestCase):
         self.assertEqual(min(2.0, max(0.5, 2.0)), 2.0)
 
 
-class TestDebatePipeline(unittest.TestCase):
-    """Tests for the 3-step debate pipeline in zundamon_answer."""
+class TestNeedsContext(unittest.TestCase):
+    """Tests for context-hint detection."""
+
+    def test_japanese_referential(self):
+        self.assertTrue(zunda_hook.needs_context("さっきのエラーは何？"))
+        self.assertTrue(zunda_hook.needs_context("このファイルの意味は？"))
+        self.assertTrue(zunda_hook.needs_context("その変更はなぜ？"))
+        self.assertTrue(zunda_hook.needs_context("今の処理を説明して"))
+
+    def test_japanese_why(self):
+        self.assertTrue(zunda_hook.needs_context("なぜそうしたの？"))
+        self.assertTrue(zunda_hook.needs_context("どうしてエラーが出た？"))
+        self.assertTrue(zunda_hook.needs_context("なんでこうなった？"))
+
+    def test_english_referential(self):
+        self.assertTrue(zunda_hook.needs_context("what did you change?"))
+        self.assertTrue(zunda_hook.needs_context("why did that fail?"))
+        self.assertTrue(zunda_hook.needs_context("the error message means?"))
+
+    def test_general_knowledge_no_context(self):
+        self.assertFalse(zunda_hook.needs_context("Pythonのデコレータって何？"))
+        self.assertFalse(zunda_hook.needs_context("git rebaseの使い方"))
+        self.assertFalse(zunda_hook.needs_context("What is a closure?"))
+
+    def test_empty_string(self):
+        self.assertFalse(zunda_hook.needs_context(""))
+
+
+class TestPipelineWithContext(unittest.TestCase):
+    """Tests for pipeline with context."""
 
     @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
     @patch.object(zunda_hook, "_call_gemini")
-    def test_full_pipeline_3_calls(self, mock_gemini):
-        """All 3 steps succeed — _call_gemini called exactly 3 times."""
+    def test_context_included_in_draft(self, mock_gemini):
+        mock_gemini.side_effect = ["draft", "final answer なのだ"]
+        zunda_hook.zundamon_answer("さっきのエラーは？", context="Claude: FileNotFoundError occurred")
+        draft_prompt = mock_gemini.call_args_list[0][0][0]
+        self.assertIn("FileNotFoundError", draft_prompt)
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_no_context_no_block(self, mock_gemini):
+        mock_gemini.side_effect = ["draft", "final なのだ"]
+        zunda_hook.zundamon_answer("Pythonとは？", context="")
+        draft_prompt = mock_gemini.call_args_list[0][0][0]
+        self.assertNotIn("参考", draft_prompt)
+
+
+class TestDebatePipeline(unittest.TestCase):
+    """Tests for the 2-step pipeline in zundamon_answer."""
+
+    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
+    @patch.object(zunda_hook, "_call_gemini")
+    def test_full_pipeline_2_calls(self, mock_gemini):
+        """Both steps succeed — _call_gemini called exactly 2 times."""
         mock_gemini.side_effect = [
             "Draft answer about Python decorators",
-            "問題なし",
             "Pythonのデコレータは関数を修飾する仕組みなのだ！",
         ]
         result = zunda_hook.zundamon_answer("Pythonのデコレータって何？")
-        self.assertEqual(mock_gemini.call_count, 3)
+        self.assertEqual(mock_gemini.call_count, 2)
         self.assertIn("なのだ", result)
 
     @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
     @patch.object(zunda_hook, "_call_gemini")
-    def test_critique_feeds_into_synthesis(self, mock_gemini):
-        """Critique output is passed to the synthesis step."""
+    def test_draft_fed_into_review(self, mock_gemini):
+        """Draft output is passed to the review step."""
         mock_gemini.side_effect = [
             "Wrong: Python is compiled",
-            "事実誤認: Pythonはインタプリタ言語である",
             "Pythonはインタプリタ言語なのだ！",
         ]
         result = zunda_hook.zundamon_answer("Pythonは何語？")
-        # Verify the 3rd call (synthesis) received the critique
-        synth_prompt = mock_gemini.call_args_list[2][0][0]
-        self.assertIn("事実誤認", synth_prompt)
+        review_prompt = mock_gemini.call_args_list[1][0][0]
+        self.assertIn("Python is compiled", review_prompt)
         self.assertIn("インタプリタ", result)
 
     @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
@@ -336,31 +381,14 @@ class TestDebatePipeline(unittest.TestCase):
 
     @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
     @patch.object(zunda_hook, "_call_gemini")
-    def test_critique_failure_uses_fallback(self, mock_gemini):
-        """If critique (step 2) fails, synthesis still runs with fallback text."""
+    def test_review_failure_returns_error(self, mock_gemini):
+        """If review (step 2) fails, return error."""
         mock_gemini.side_effect = [
             "Draft answer",
             Exception("API error"),
-            "最終回答なのだ！",
         ]
         result = zunda_hook.zundamon_answer("test question")
-        self.assertEqual(mock_gemini.call_count, 3)
-        # Verify fallback critique was used
-        synth_prompt = mock_gemini.call_args_list[2][0][0]
-        self.assertIn("検証できなかった", synth_prompt)
-        self.assertIn("なのだ", result)
-
-    @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
-    @patch.object(zunda_hook, "_call_gemini")
-    def test_synthesis_failure_returns_error(self, mock_gemini):
-        """If synthesis (step 3) fails, return error."""
-        mock_gemini.side_effect = [
-            "Draft answer",
-            "問題なし",
-            Exception("API error"),
-        ]
-        result = zunda_hook.zundamon_answer("test question")
-        self.assertEqual(mock_gemini.call_count, 3)
+        self.assertEqual(mock_gemini.call_count, 2)
         self.assertIn("うまく答えられなかった", result)
 
     @patch.object(zunda_hook, "GEMINI_API_KEY", "")
@@ -371,9 +399,9 @@ class TestDebatePipeline(unittest.TestCase):
 
     @patch.object(zunda_hook, "GEMINI_API_KEY", "fake-key")
     @patch.object(zunda_hook, "_call_gemini")
-    def test_question_passed_to_all_steps(self, mock_gemini):
-        """The original question appears in all 3 prompts."""
-        mock_gemini.side_effect = ["draft", "critique", "final"]
+    def test_question_passed_to_both_steps(self, mock_gemini):
+        """The original question appears in both prompts."""
+        mock_gemini.side_effect = ["draft", "final"]
         zunda_hook.zundamon_answer("リスト内包表記とは")
         for call in mock_gemini.call_args_list:
             self.assertIn("リスト内包表記", call[0][0])

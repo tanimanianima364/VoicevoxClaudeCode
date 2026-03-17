@@ -91,53 +91,56 @@ def _call_gemini(prompt: str, max_tokens: int = 300, temperature: float = 0.7) -
         return data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
-def zundamon_answer(question: str) -> str:
-    """Answer a question using a 3-step debate pipeline: Draft → Critique → Final."""
+# Words that suggest the question references the current conversation
+CONTEXT_HINT_WORDS = [
+    "さっき", "今の", "この", "その", "それ", "あの", "あれ",
+    "上の", "前の", "先ほど",
+    "なぜ", "どうして", "なんで",
+    "what did", "why did", "the error", "that", "this",
+]
+
+
+def needs_context(question: str) -> bool:
+    """Detect if a question likely references the current conversation."""
+    q = question.lower()
+    return any(hint in q for hint in CONTEXT_HINT_WORDS)
+
+
+def zundamon_answer(question: str, context: str = "") -> str:
+    """Answer a question using a 2-step pipeline: Draft → Review & Finalize."""
     if not GEMINI_API_KEY:
         return "Gemini APIキーが設定されてないのだ！"
 
     # Step 1: Draft — generate an initial answer
+    context_block = f"\n\n参考: 以下はClaudeと開発者の直近の会話です:\n{context}" if context else ""
     draft_prompt = (
-        "以下のユーザーの質問に、技術的に正確かつ簡潔に答えてください。200文字以内。\n\n"
+        "以下のユーザーの質問に、技術的に正確かつ簡潔に答えてください。10000文字以内。\n\n"
         f"質問: {question}"
+        f"{context_block}"
     )
     try:
-        draft = _call_gemini(draft_prompt, max_tokens=400, temperature=0.7)
+        draft = _call_gemini(draft_prompt, max_tokens=8192, temperature=0.7)
         log(f"[debate] draft: {draft[:100]}")
     except Exception as e:
         return f"うまく答えられなかったのだ…{e}"
 
-    # Step 2: Critique — fact-check and identify issues
-    critique_prompt = (
-        "あなたは厳密なファクトチェッカーです。\n"
-        "以下の「質問」と「回答案」を検証し、事実誤認・不正確な点・不足している点を指摘してください。\n"
-        "問題がなければ「問題なし」とだけ答えてください。200文字以内。\n\n"
+    # Step 2: Review & Finalize — fact-check, fix issues, output as Zundamon
+    review_prompt = (
+        "あなたは「ずんだもん」です。東北地方の妖精で、語尾に「なのだ」「のだ」をつけて話します。\n"
+        "以下の「質問」と「回答案」を検証し、事実誤認や不足があれば修正した上で、最終回答を作成してください。\n"
+        "ルール:\n"
+        "- まず回答案の正確性を検証すること\n"
+        "- 問題があれば修正して最終回答に反映すること\n"
+        "- 語尾は「なのだ」「のだ」「だよ」を使う\n"
+        "- 技術用語はそのまま使ってOK\n"
+        "- 明るく元気な口調で\n"
+        "- 10000文字以内で簡潔に答えること\n"
+        "- 余計な前置きは不要。回答だけ出力すること\n\n"
         f"質問: {question}\n\n"
         f"回答案: {draft}"
     )
     try:
-        critique = _call_gemini(critique_prompt, max_tokens=400, temperature=0.3)
-        log(f"[debate] critique: {critique[:100]}")
-    except Exception:
-        critique = "検証できなかったため、回答案をそのまま使用する"
-
-    # Step 3: Synthesize — produce final Zundamon-style answer
-    synth_prompt = (
-        "あなたは「ずんだもん」です。東北地方の妖精で、語尾に「なのだ」「のだ」をつけて話します。\n"
-        "以下の「質問」「回答案」「批評」を踏まえて、正確さを担保した最終回答を作成してください。\n"
-        "ルール:\n"
-        "- 語尾は「なのだ」「のだ」「だよ」を使う\n"
-        "- 批評で指摘された問題があれば修正すること\n"
-        "- 技術用語はそのまま使ってOK\n"
-        "- 明るく元気な口調で\n"
-        "- 200文字以内で簡潔に答えること\n"
-        "- 余計な前置きは不要。回答だけ出力すること\n\n"
-        f"質問: {question}\n\n"
-        f"回答案: {draft}\n\n"
-        f"批評: {critique}"
-    )
-    try:
-        final = _call_gemini(synth_prompt, max_tokens=400, temperature=0.5)
+        final = _call_gemini(review_prompt, max_tokens=8192, temperature=0.4)
         log(f"[debate] final: {final[:100]}")
         return final
     except Exception as e:
@@ -386,13 +389,30 @@ def handle_user_prompt(hook_input: dict):
         print("Enter a question! e.g. @zunda What is Python?", file=sys.stderr)
         sys.exit(2)
 
-    log(f"zundamon question: {question[:200]}")
+    # Auto-detect if context is needed
+    use_context = needs_context(question)
+    log(f"zundamon question: {question[:200]} (context={'yes' if use_context else 'no'})")
+
+    # Write question (+ optional context) to temp file for background process
+    qa_data = {"question": question}
+    if use_context:
+        transcript_path = hook_input.get("transcript_path", "")
+        ctx = read_transcript(transcript_path, full=True)
+        if ctx:
+            # Limit context to keep it reasonable for Q&A
+            qa_data["context"] = ctx[-50000:]
+
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
+    tmp.write(json.dumps(qa_data, ensure_ascii=False))
+    tmp.close()
+
     subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), "--answer", question],
+        [sys.executable, os.path.abspath(__file__), "--answer-file", tmp.name],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    print("Zundamon is thinking...", file=sys.stderr)
+    msg = "Zundamon is thinking (with context)..." if use_context else "Zundamon is thinking..."
+    print(msg, file=sys.stderr)
     sys.exit(2)
 
 
@@ -522,17 +542,34 @@ def run_summarize_mode(text_file: str):
     log("done (stop summary)")
 
 
-def run_answer_mode(question: str):
-    """Background mode: answer a question and play speech."""
-    answer = zundamon_answer(question)
+def run_answer_mode(data_file: str):
+    """Background mode: read question (+ optional context) from file, answer, and speak."""
+    try:
+        with open(data_file, "r", encoding="utf-8") as f:
+            data = json.loads(f.read())
+    finally:
+        try:
+            os.unlink(data_file)
+        except OSError:
+            pass
+
+    question = data.get("question", "")
+    context = data.get("context", "")
+    if context:
+        log(f"answering with context ({len(context)} chars)")
+    answer = zundamon_answer(question, context=context)
     log(f"zundamon answer: {answer}")
     speak_voicevox(answer)
     log("done (user prompt Q&A)")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 3 and sys.argv[1] == "--answer":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--answer-file":
         run_answer_mode(sys.argv[2])
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--answer":
+        # Legacy: direct question string (used by @zunda on/off greetings)
+        answer = zundamon_answer(sys.argv[2])
+        speak_voicevox(answer)
     elif len(sys.argv) >= 3 and sys.argv[1] == "--summarize-file":
         run_summarize_mode(sys.argv[2])
     else:

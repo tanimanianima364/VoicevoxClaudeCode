@@ -41,15 +41,18 @@ Type `@zunda` followed by a question, and Zundamon will answer via voice.
 
 Prompts starting with `@zunda` are **not sent to Claude** (exit code 2). The Gemini + VOICEVOX pipeline runs in the background.
 
-### Debate Pipeline (Fact-Checking)
+### 2-Step Review Pipeline (Fact-Checking)
 
-Questions go through a 3-step pipeline to ensure accuracy:
+Questions go through a 2-step pipeline to ensure accuracy:
 
 1. **Draft** — Gemini generates an initial answer (temperature 0.7)
-2. **Critique** — A second Gemini call fact-checks the draft, identifying inaccuracies or gaps (temperature 0.3)
-3. **Synthesize** — A third call produces the final Zundamon-style answer, incorporating corrections from the critique (temperature 0.5)
+2. **Review & Finalize** — A second Gemini call fact-checks the draft, fixes any inaccuracies, and produces the final Zundamon-style answer (temperature 0.4)
 
-If the critique step fails, synthesis proceeds with the original draft. If the draft step fails, an error is returned immediately.
+If the draft step fails, an error is returned immediately. If the review step fails, an error is returned.
+
+### Auto Context Detection
+
+Questions are automatically analyzed for conversational references. If hint words are detected (e.g., "さっき", "この", "その", "why did", "the error"), the conversation transcript is included as context for the answer. General knowledge questions are answered without context to save tokens and latency.
 
 ## Concurrent Playback
 
@@ -65,7 +68,8 @@ When multiple projects trigger speech simultaneously, a lock file serializes aud
 - **Full mode** on demand via `@zunda full` — sends entire conversation (up to 1M tokens)
 - **Status check** via `@zunda status`
 - **Configurable speech speed** (0.5x–2.0x) with validation
-- **3-step debate pipeline** for Q&A — Draft → Critique → Synthesize
+- **2-step review pipeline** for Q&A — Draft → Review & Finalize
+- **Auto context detection** — conversation history included only when question references it
 
 ## Requirements
 
@@ -142,7 +146,7 @@ This will automatically start the VOICEVOX Docker container if needed.
 python3 test_logic.py -v
 ```
 
-Covers transcript parsing, delta offset tracking, project activation, command dispatch, speed validation, debate pipeline, and summarization (41 tests).
+Covers transcript parsing, delta offset tracking, project activation, command dispatch, speed validation, debate pipeline, and summarization (47 tests).
 
 ### Integration tests (requires Gemini API key and/or VOICEVOX)
 
